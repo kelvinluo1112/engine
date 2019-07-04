@@ -4,17 +4,11 @@
 
 #import <Cocoa/Cocoa.h>
 
+#import "FLEEngine.h"
 #import "FLEOpenGLContextHandling.h"
-#import "FLEPluginRegistrar.h"
 #import "FLEReshapeListener.h"
-
-#if defined(FLUTTER_FRAMEWORK)
-#import "flutter/shell/platform/darwin/ios/framework/Headers/FlutterBinaryMessenger.h"
-#import "flutter/shell/platform/darwin/ios/framework/Headers/FlutterMacros.h"
-#else
-#import "FlutterBinaryMessenger.h"
 #import "FlutterMacros.h"
-#endif
+#import "FlutterPluginRegistrarMacOS.h"
 
 typedef NS_ENUM(NSInteger, FlutterMouseTrackingMode) {
   // Hover events will never be sent to Flutter.
@@ -35,18 +29,22 @@ typedef NS_ENUM(NSInteger, FlutterMouseTrackingMode) {
  * Flutter engine in non-interactive mode, or with a drawable Flutter canvas.
  */
 FLUTTER_EXPORT
-@interface FLEViewController
-    : NSViewController <FlutterBinaryMessenger, FLEPluginRegistrar, FLEReshapeListener>
+@interface FLEViewController : NSViewController <FlutterPluginRegistry, FLEReshapeListener>
 
 /**
- * The view this controller manages when launched in interactive mode (headless set to false). Must
- * be capable of handling text input events, and the OpenGL context handling protocols.
+ * The view this controller manages. Must be capable of handling text input events, and the OpenGL
+ * context handling protocols.
  */
 @property(nullable) NSView<FLEOpenGLContextHandling>* view;
 
 /**
+ * The Flutter engine associated with this view controller.
+ */
+@property(nonatomic, nonnull, readonly) FLEEngine* engine;
+
+/**
  * The style of mouse tracking to use for the view. Defaults to
- * FlutterMouseTrackingModeNone.
+ * FlutterMouseTrackingModeInKeyWindow.
  */
 @property(nonatomic) FlutterMouseTrackingMode mouseTrackingMode;
 
@@ -55,27 +53,13 @@ FLUTTER_EXPORT
  *
  * @param assets The path to the flutter_assets folder for the Flutter application to be run.
  * @param arguments Arguments to pass to the Flutter engine. See
- *               https://github.com/flutter/engine/blob/master/shell/common/switches.h
- *               for details. Not all arguments will apply to embedding mode.
- *               Note: This API layer will likely abstract arguments in the future, instead of
- *               providing a direct passthrough.
+ *                  https://github.com/flutter/engine/blob/master/shell/common/switches.h
+ *                  for details. Not all arguments will apply to embedding mode.
+ *                  Note: This API layer will abstract in the future, instead of providing a direct
+ *                  passthrough.
  * @return YES if the engine launched successfully.
  */
 - (BOOL)launchEngineWithAssetsPath:(nonnull NSURL*)assets
               commandLineArguments:(nullable NSArray<NSString*>*)arguments;
-
-/**
- * Launches the Flutter engine in headless mode with the provided configuration. In headless mode,
- * this controller's view should not be displayed.
- *
- * See launcheEngineWithAssetsPath:commandLineArguments: for details.
- */
-- (BOOL)launchHeadlessEngineWithAssetsPath:(nonnull NSURL*)assets
-                      commandLineArguments:(nullable NSArray<NSString*>*)arguments;
-
-/**
- * Returns the FLEPluginRegistrar that should be used to register the plugin with the given name.
- */
-- (nonnull id<FLEPluginRegistrar>)registrarForPlugin:(nonnull NSString*)pluginName;
 
 @end

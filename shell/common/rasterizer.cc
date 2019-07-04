@@ -16,21 +16,34 @@
 #include "third_party/skia/include/core/SkSurfaceCharacterization.h"
 #include "third_party/skia/include/utils/SkBase64.h"
 
-namespace shell {
+namespace flutter {
 
 // The rasterizer will tell Skia to purge cached resources that have not been
 // used within this interval.
 static constexpr std::chrono::milliseconds kSkiaCleanupExpiration(15000);
 
-Rasterizer::Rasterizer(blink::TaskRunners task_runners)
-    : Rasterizer(std::move(task_runners),
-                 std::make_unique<flow::CompositorContext>()) {}
+// TODO(dnfield): Remove this once internal embedders have caught up.
+static Rasterizer::DummyDelegate dummy_delegate_;
+Rasterizer::Rasterizer(
+    TaskRunners task_runners,
+    std::unique_ptr<flutter::CompositorContext> compositor_context)
+    : Rasterizer(dummy_delegate_,
+                 std::move(task_runners),
+                 std::move(compositor_context)) {}
+
+Rasterizer::Rasterizer(Delegate& delegate, TaskRunners task_runners)
+    : Rasterizer(delegate,
+                 std::move(task_runners),
+                 std::make_unique<flutter::CompositorContext>()) {}
 
 Rasterizer::Rasterizer(
-    blink::TaskRunners task_runners,
-    std::unique_ptr<flow::CompositorContext> compositor_context)
-    : task_runners_(std::move(task_runners)),
+    Delegate& delegate,
+    TaskRunners task_runners,
+    std::unique_ptr<flutter::CompositorContext> compositor_context)
+    : delegate_(delegate),
+      task_runners_(std::move(task_runners)),
       compositor_context_(std::move(compositor_context)),
+      user_override_resource_cache_bytes_(false),
       weak_factory_(this) {
   FML_DCHECK(compositor_context_);
 }
@@ -41,7 +54,7 @@ fml::WeakPtr<Rasterizer> Rasterizer::GetWeakPtr() const {
   return weak_factory_.GetWeakPtr();
 }
 
-fml::WeakPtr<blink::SnapshotDelegate> Rasterizer::GetSnapshotDelegate() const {
+fml::WeakPtr<SnapshotDelegate> Rasterizer::GetSnapshotDelegate() const {
   return weak_factory_.GetWeakPtr();
 }
 
@@ -56,11 +69,24 @@ void Rasterizer::Teardown() {
   last_layer_tree_.reset();
 }
 
-flow::TextureRegistry* Rasterizer::GetTextureRegistry() {
+void Rasterizer::NotifyLowMemoryWarning() const {
+  if (!surface_) {
+    FML_DLOG(INFO) << "Rasterizer::PurgeCaches called with no surface.";
+    return;
+  }
+  auto context = surface_->GetContext();
+  if (!context) {
+    FML_DLOG(INFO) << "Rasterizer::PurgeCaches called with no GrContext.";
+    return;
+  }
+  context->freeGpuResources();
+}
+
+flutter::TextureRegistry* Rasterizer::GetTextureRegistry() {
   return &compositor_context_->texture_registry();
 }
 
-flow::LayerTree* Rasterizer::GetLastLayerTree() {
+flutter::LayerTree* Rasterizer::GetLastLayerTree() {
   return last_layer_tree_.get();
 }
 
@@ -71,17 +97,16 @@ void Rasterizer::DrawLastLayerTree() {
   DrawToSurface(*last_layer_tree_);
 }
 
-void Rasterizer::Draw(
-    fml::RefPtr<flutter::Pipeline<flow::LayerTree>> pipeline) {
+void Rasterizer::Draw(fml::RefPtr<Pipeline<flutter::LayerTree>> pipeline) {
   TRACE_EVENT0("flutter", "GPURasterizer::Draw");
 
-  flutter::Pipeline<flow::LayerTree>::Consumer consumer =
+  Pipeline<flutter::LayerTree>::Consumer consumer =
       std::bind(&Rasterizer::DoDraw, this, std::placeholders::_1);
 
   // Consume as many pipeline items as possible. But yield the event loop
   // between successive tries.
   switch (pipeline->Consume(consumer)) {
-    case flutter::PipelineConsumeResult::MoreAvailable: {
+    case PipelineConsumeResult::MoreAvailable: {
       task_runners_.GetGPUTaskRunner()->PostTask(
           [weak_this = weak_factory_.GetWeakPtr(), pipeline]() {
             if (weak_this) {
@@ -147,15 +172,22 @@ sk_sp<SkImage> Rasterizer::MakeRasterSnapshot(sk_sp<SkPicture> picture,
   return nullptr;
 }
 
-void Rasterizer::DoDraw(std::unique_ptr<flow::LayerTree> layer_tree) {
+void Rasterizer::DoDraw(std::unique_ptr<flutter::LayerTree> layer_tree) {
+  FML_DCHECK(task_runners_.GetGPUTaskRunner()->RunsTasksOnCurrentThread());
+
   if (!layer_tree || !surface_) {
     return;
   }
 
+  FrameTiming timing;
+  timing.Set(FrameTiming::kBuildStart, layer_tree->build_start());
+  timing.Set(FrameTiming::kBuildFinish, layer_tree->build_finish());
+  timing.Set(FrameTiming::kRasterStart, fml::TimePoint::Now());
+
   PersistentCache* persistent_cache = PersistentCache::GetCacheForProcess();
   persistent_cache->ResetStoredNewShaders();
 
-  if (DrawToSurface(*layer_tree)) {
+  if (DrawToSurface(*layer_tree) == RasterStatus::kSuccess) {
     last_layer_tree_ = std::move(layer_tree);
   }
 
@@ -165,21 +197,27 @@ void Rasterizer::DoDraw(std::unique_ptr<flow::LayerTree> layer_tree) {
         ScreenshotLastLayerTree(ScreenshotType::SkiaPicture, false);
     persistent_cache->DumpSkp(*screenshot.data);
   }
+
+  // TODO(liyuqian): in Fuchsia, the rasterization doesn't finish when
+  // Rasterizer::DoDraw finishes. Future work is needed to adapt the timestamp
+  // for Fuchsia to capture SceneUpdateContext::ExecutePaintTasks.
+  timing.Set(FrameTiming::kRasterFinish, fml::TimePoint::Now());
+  delegate_.OnFrameRasterized(timing);
 }
 
-bool Rasterizer::DrawToSurface(flow::LayerTree& layer_tree) {
+RasterStatus Rasterizer::DrawToSurface(flutter::LayerTree& layer_tree) {
   FML_DCHECK(surface_);
 
   auto frame = surface_->AcquireFrame(layer_tree.frame_size());
 
   if (frame == nullptr) {
-    return false;
+    return RasterStatus::kFailed;
   }
 
   // There is no way for the compositor to know how long the layer tree
   // construction took. Fortunately, the layer tree does. Grab that time
   // for instrumentation.
-  compositor_context_->engine_time().SetLapTime(layer_tree.construction_time());
+  compositor_context_->ui_time().SetLapTime(layer_tree.build_time());
 
   auto* canvas = frame->SkiaCanvas();
 
@@ -193,7 +231,11 @@ bool Rasterizer::DrawToSurface(flow::LayerTree& layer_tree) {
       surface_->GetContext(), canvas, external_view_embedder,
       surface_->GetRootTransformation(), true);
 
-  if (compositor_frame && compositor_frame->Raster(layer_tree, false)) {
+  if (compositor_frame) {
+    RasterStatus raster_status = compositor_frame->Raster(layer_tree, false);
+    if (raster_status == RasterStatus::kFailed) {
+      return raster_status;
+    }
     frame->Submit();
     if (external_view_embedder != nullptr) {
       external_view_embedder->SubmitFrame(surface_->GetContext());
@@ -203,10 +245,10 @@ bool Rasterizer::DrawToSurface(flow::LayerTree& layer_tree) {
     if (surface_->GetContext())
       surface_->GetContext()->performDeferredCleanup(kSkiaCleanupExpiration);
 
-    return true;
+    return raster_status;
   }
 
-  return false;
+  return RasterStatus::kFailed;
 }
 
 static sk_sp<SkData> SerializeTypeface(SkTypeface* typeface, void* ctx) {
@@ -214,8 +256,8 @@ static sk_sp<SkData> SerializeTypeface(SkTypeface* typeface, void* ctx) {
 }
 
 static sk_sp<SkData> ScreenshotLayerTreeAsPicture(
-    flow::LayerTree* tree,
-    flow::CompositorContext& compositor_context) {
+    flutter::LayerTree* tree,
+    flutter::CompositorContext& compositor_context) {
   FML_DCHECK(tree != nullptr);
   SkPictureRecorder recorder;
   recorder.beginRecording(
@@ -257,8 +299,8 @@ static sk_sp<SkSurface> CreateSnapshotSurface(GrContext* surface_context,
 }
 
 static sk_sp<SkData> ScreenshotLayerTreeAsImage(
-    flow::LayerTree* tree,
-    flow::CompositorContext& compositor_context,
+    flutter::LayerTree* tree,
+    flutter::CompositorContext& compositor_context,
     GrContext* surface_context,
     bool compressed) {
   // Attempt to create a snapshot surface depending on whether we have access to
@@ -370,13 +412,31 @@ void Rasterizer::FireNextFrameCallbackIfPresent() {
   callback();
 }
 
-void Rasterizer::SetResourceCacheMaxBytes(int max_bytes) {
+void Rasterizer::SetResourceCacheMaxBytes(size_t max_bytes, bool from_user) {
+  user_override_resource_cache_bytes_ |= from_user;
+
+  if (!from_user && user_override_resource_cache_bytes_) {
+    // We should not update the setting here if a user has explicitly set a
+    // value for this over the flutter/skia channel.
+    return;
+  }
+
   GrContext* context = surface_->GetContext();
   if (context) {
     int max_resources;
     context->getResourceCacheLimits(&max_resources, nullptr);
     context->setResourceCacheLimits(max_resources, max_bytes);
   }
+}
+
+size_t Rasterizer::GetResourceCacheMaxBytes() const {
+  GrContext* context = surface_->GetContext();
+  if (context) {
+    size_t max_bytes;
+    context->getResourceCacheLimits(nullptr, &max_bytes);
+    return max_bytes;
+  }
+  return 0;
 }
 
 Rasterizer::Screenshot::Screenshot() {}
@@ -388,4 +448,4 @@ Rasterizer::Screenshot::Screenshot(const Screenshot& other) = default;
 
 Rasterizer::Screenshot::~Screenshot() = default;
 
-}  // namespace shell
+}  // namespace flutter

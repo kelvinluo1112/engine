@@ -17,6 +17,8 @@
 #include "paragraph.h"
 
 #include <hb.h>
+#include <minikin/Layout.h>
+
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -24,7 +26,6 @@
 #include <utility>
 #include <vector>
 
-#include <minikin/Layout.h>
 #include "flutter/fml/logging.h"
 #include "font_collection.h"
 #include "font_skia.h"
@@ -34,9 +35,6 @@
 #include "minikin/LayoutUtils.h"
 #include "minikin/LineBreaker.h"
 #include "minikin/MinikinFont.h"
-#include "unicode/ubidi.h"
-#include "unicode/utf16.h"
-
 #include "third_party/skia/include/core/SkCanvas.h"
 #include "third_party/skia/include/core/SkFont.h"
 #include "third_party/skia/include/core/SkFontMetrics.h"
@@ -46,6 +44,8 @@
 #include "third_party/skia/include/core/SkTypeface.h"
 #include "third_party/skia/include/effects/SkDashPathEffect.h"
 #include "third_party/skia/include/effects/SkDiscretePathEffect.h"
+#include "unicode/ubidi.h"
+#include "unicode/utf16.h"
 
 namespace txt {
 namespace {
@@ -163,6 +163,7 @@ void GetFontAndMinikinPaint(const TextStyle& style,
   // between same text content with different runs composing it, however, it
   // also produces more accurate layouts.
   paint->paintFlags |= minikin::LinearTextFlag;
+  paint->fontFeatureSettings = style.font_features.GetFeatureSettings();
 }
 
 void FindWords(const std::vector<uint16_t>& text,
@@ -208,13 +209,15 @@ Paragraph::CodeUnitRun::CodeUnitRun(std::vector<GlyphPosition>&& p,
                                     Range<double> x,
                                     size_t line,
                                     const SkFontMetrics& metrics,
-                                    TextDirection dir)
+                                    TextDirection dir,
+                                    const PlaceholderRun* placeholder)
     : positions(std::move(p)),
       code_units(cu),
       x_pos(x),
       line_number(line),
       font_metrics(metrics),
-      direction(dir) {}
+      direction(dir),
+      placeholder_run(placeholder) {}
 
 void Paragraph::CodeUnitRun::Shift(double delta) {
   x_pos.Shift(delta);
@@ -236,21 +239,33 @@ void Paragraph::SetText(std::vector<uint16_t> text, StyledRuns runs) {
   runs_ = std::move(runs);
 }
 
+void Paragraph::SetInlinePlaceholders(
+    std::vector<PlaceholderRun> inline_placeholders,
+    std::unordered_set<size_t> obj_replacement_char_indexes) {
+  needs_layout_ = true;
+  inline_placeholders_ = std::move(inline_placeholders);
+  obj_replacement_char_indexes_ = std::move(obj_replacement_char_indexes);
+}
+
 bool Paragraph::ComputeLineBreaks() {
   line_ranges_.clear();
   line_widths_.clear();
   max_intrinsic_width_ = 0;
 
   std::vector<size_t> newline_positions;
+  // Discover and add all hard breaks.
   for (size_t i = 0; i < text_.size(); ++i) {
     ULineBreak ulb = static_cast<ULineBreak>(
         u_getIntPropertyValue(text_[i], UCHAR_LINE_BREAK));
     if (ulb == U_LB_LINE_FEED || ulb == U_LB_MANDATORY_BREAK)
       newline_positions.push_back(i);
   }
+  // Break at the end of the paragraph.
   newline_positions.push_back(text_.size());
 
+  // Calculate and add any breaks due to a line being too long.
   size_t run_index = 0;
+  size_t inline_placeholder_index = 0;
   for (size_t newline_index = 0; newline_index < newline_positions.size();
        ++newline_index) {
     size_t block_start =
@@ -265,6 +280,9 @@ bool Paragraph::ComputeLineBreaks() {
       continue;
     }
 
+    // Setup breaker. We wait to set the line width in order to account for the
+    // widths of the inline placeholders, which are calcualted in the loop over
+    // the runs.
     breaker_.setLineWidths(0.0f, 0, width_);
     breaker_.setJustified(paragraph_style_.text_align == TextAlign::justify);
     breaker_.setStrategy(paragraph_style_.break_strategy);
@@ -300,15 +318,38 @@ bool Paragraph::ComputeLineBreaks() {
       size_t run_start = std::max(run.start, block_start) - block_start;
       size_t run_end = std::min(run.end, block_end) - block_start;
       bool isRtl = (paragraph_style_.text_direction == TextDirection::rtl);
-      double run_width = breaker_.addStyleRun(&paint, collection, font,
-                                              run_start, run_end, isRtl);
-      block_total_width += run_width;
+
+      // Check if the run is an object replacement character-only run. We should
+      // leave space for inline placeholder and break around it if appropriate.
+      if (run.end - run.start == 1 &&
+          obj_replacement_char_indexes_.count(run.start) != 0 &&
+          text_[run.start] == objReplacementChar &&
+          inline_placeholder_index < inline_placeholders_.size()) {
+        // Is a inline placeholder run.
+        PlaceholderRun placeholder_run =
+            inline_placeholders_[inline_placeholder_index];
+        block_total_width += placeholder_run.width;
+
+        // Inject custom width into minikin breaker. (Uses LibTxt-minikin
+        // patch).
+        breaker_.setCustomCharWidth(run.start, placeholder_run.width);
+
+        // Called with nullptr as paint in order to use the custom widths passed
+        // above.
+        breaker_.addStyleRun(nullptr, collection, font, run_start, run_end,
+                             isRtl);
+        inline_placeholder_index++;
+      } else {
+        // Is a regular text run.
+        double run_width = breaker_.addStyleRun(&paint, collection, font,
+                                                run_start, run_end, isRtl);
+        block_total_width += run_width;
+      }
 
       if (run.end > block_end)
         break;
       run_index++;
     }
-
     max_intrinsic_width_ = std::max(max_intrinsic_width_, block_total_width);
 
     size_t breaks_count = breaker_.computeBreaks();
@@ -361,6 +402,33 @@ bool Paragraph::ComputeBidiRuns(std::vector<BidiRun>* result) {
   if (!U_SUCCESS(status))
     return false;
 
+  // Detect if final trailing run is a single ambiguous whitespace.
+  // We want to bundle the final ambiguous whitespace with the preceding
+  // run in order to maintain logical typing behavior when mixing RTL and LTR
+  // text. We do not want this to be a true ghost run since the contrasting
+  // directionality causes the trailing space to not render at the visual end of
+  // the paragraph.
+  //
+  // This only applies to the final whitespace at the end as other whitespace is
+  // no longer ambiguous when surrounded by additional text.
+  bool has_trailing_whitespace = false;
+  int32_t bidi_run_start, bidi_run_length;
+  if (bidi_run_count > 1) {
+    ubidi_getVisualRun(bidi.get(), bidi_run_count - 1, &bidi_run_start,
+                       &bidi_run_length);
+    if (!U_SUCCESS(status))
+      return false;
+    if (bidi_run_length == 1) {
+      UChar32 last_char;
+      U16_GET(text_.data(), 0, bidi_run_start + bidi_run_length - 1,
+              static_cast<int>(text_.size()), last_char);
+      if (u_hasBinaryProperty(last_char, UCHAR_WHITE_SPACE)) {
+        has_trailing_whitespace = true;
+        bidi_run_count--;
+      }
+    }
+  }
+
   // Build a map of styled runs indexed by start position.
   std::map<size_t, StyledRuns::Run> styled_run_map;
   for (size_t i = 0; i < runs_.size(); ++i) {
@@ -370,7 +438,6 @@ bool Paragraph::ComputeBidiRuns(std::vector<BidiRun>* result) {
 
   for (int32_t bidi_run_index = 0; bidi_run_index < bidi_run_count;
        ++bidi_run_index) {
-    int32_t bidi_run_start, bidi_run_length;
     UBiDiDirection direction = ubidi_getVisualRun(
         bidi.get(), bidi_run_index, &bidi_run_start, &bidi_run_length);
     if (!U_SUCCESS(status))
@@ -396,6 +463,11 @@ bool Paragraph::ComputeBidiRuns(std::vector<BidiRun>* result) {
     }
     if (bidi_run_length == 0)
       continue;
+
+    // Attach the final trailing whitespace as part of this run.
+    if (has_trailing_whitespace && bidi_run_index == bidi_run_count - 1) {
+      bidi_run_length++;
+    }
 
     size_t bidi_run_end = bidi_run_start + bidi_run_length;
     TextDirection text_direction =
@@ -424,6 +496,12 @@ bool Paragraph::ComputeBidiRuns(std::vector<BidiRun>* result) {
   return true;
 }
 
+bool Paragraph::IsStrutValid() const {
+  // Font size must be positive.
+  return (paragraph_style_.strut_enabled &&
+          paragraph_style_.strut_font_size >= 0);
+}
+
 void Paragraph::ComputeStrut(StrutMetrics* strut, SkFont& font) {
   strut->ascent = 0;
   strut->descent = 0;
@@ -432,15 +510,12 @@ void Paragraph::ComputeStrut(StrutMetrics* strut, SkFont& font) {
   strut->line_height = 0;
   strut->force_strut = false;
 
-  // Font size must be positive.
-  bool valid_strut =
-      paragraph_style_.strut_enabled && paragraph_style_.strut_font_size >= 0;
-  if (!valid_strut) {
+  if (!IsStrutValid())
     return;
-  }
+
   // force_strut makes all lines have exactly the strut metrics, and ignores all
   // actual metrics. We only force the strut if the strut is non-zero and valid.
-  strut->force_strut = paragraph_style_.force_strut_height && valid_strut;
+  strut->force_strut = paragraph_style_.force_strut_height;
   minikin::FontStyle minikin_font_style(
       0, GetWeight(paragraph_style_.strut_font_weight),
       paragraph_style_.strut_font_style == FontStyle::italic);
@@ -476,14 +551,90 @@ void Paragraph::ComputeStrut(StrutMetrics* strut, SkFont& font) {
   }
 }
 
+void Paragraph::ComputePlaceholder(PlaceholderRun* placeholder_run,
+                                   double& ascent,
+                                   double& descent) {
+  if (placeholder_run != nullptr) {
+    // Calculate how much to shift the ascent and descent to account
+    // for the baseline choice.
+    //
+    // TODO(garyq): implement for various baselines. Currently only
+    // supports for alphabetic and ideographic
+    double baseline_adjustment = 0;
+    switch (placeholder_run->baseline) {
+      case TextBaseline::kAlphabetic: {
+        baseline_adjustment = 0;
+        break;
+      }
+      case TextBaseline::kIdeographic: {
+        baseline_adjustment = -descent / 2;
+        break;
+      }
+    }
+    // Convert the ascent and descent from the font's to the placeholder
+    // rect's.
+    switch (placeholder_run->alignment) {
+      case PlaceholderAlignment::kBaseline: {
+        ascent = baseline_adjustment + placeholder_run->baseline_offset;
+        descent = -baseline_adjustment + placeholder_run->height -
+                  placeholder_run->baseline_offset;
+        break;
+      }
+      case PlaceholderAlignment::kAboveBaseline: {
+        ascent = baseline_adjustment + placeholder_run->height;
+        descent = -baseline_adjustment;
+        break;
+      }
+      case PlaceholderAlignment::kBelowBaseline: {
+        descent = baseline_adjustment + placeholder_run->height;
+        ascent = -baseline_adjustment;
+        break;
+      }
+      case PlaceholderAlignment::kTop: {
+        descent = placeholder_run->height - ascent;
+        break;
+      }
+      case PlaceholderAlignment::kBottom: {
+        ascent = placeholder_run->height - descent;
+        break;
+      }
+      case PlaceholderAlignment::kMiddle: {
+        double mid = (ascent - descent) / 2;
+        ascent = mid + placeholder_run->height / 2;
+        descent = -mid + placeholder_run->height / 2;
+        break;
+      }
+    }
+    placeholder_run->baseline_offset = ascent;
+  }
+}
+
+// Implementation outline:
+//
+// -For each line:
+//   -Compute Bidi runs, convert into line_runs (keeps in-line-range runs, adds
+//   special runs)
+//   -For each line_run (runs in the line):
+//     -Calculate ellipsis
+//     -Obtain font
+//     -layout.doLayout(...), genereates glyph blobs
+//     -For each glyph blob:
+//       -Convert glyph blobs into pixel metrics/advances
+//     -Store as paint records (for painting) and code unit runs (for metrics
+//     and boxes).
+//   -Apply letter spacing, alignment, justification, etc
+//   -Calculate line vertical layout (ascent, descent, etc)
+//   -Store per-line metrics
 void Paragraph::Layout(double width, bool force) {
+  double rounded_width = floor(width);
   // Do not allow calling layout multiple times without changing anything.
-  if (!needs_layout_ && width == width_ && !force) {
+  if (!needs_layout_ && rounded_width == width_ && !force) {
     return;
   }
-  needs_layout_ = false;
 
-  width_ = floor(width);
+  width_ = rounded_width;
+
+  needs_layout_ = false;
 
   if (!ComputeLineBreaks())
     return;
@@ -495,13 +646,14 @@ void Paragraph::Layout(double width, bool force) {
   SkFont font;
   font.setEdging(SkFont::Edging::kAntiAlias);
   font.setSubpixel(true);
-  font.setHinting(kSlight_SkFontHinting);
+  font.setHinting(SkFontHinting::kSlight);
 
   records_.clear();
   line_heights_.clear();
   line_baselines_.clear();
   glyph_lines_.clear();
   code_unit_runs_.clear();
+  inline_placeholder_code_unit_runs_.clear();
   line_max_spacings_.clear();
   line_max_descent_.clear();
   line_max_ascent_.clear();
@@ -515,13 +667,13 @@ void Paragraph::Layout(double width, bool force) {
   double max_word_width = 0;
 
   // Compute strut minimums according to paragraph_style_.
-  StrutMetrics strut;
-  ComputeStrut(&strut, font);
+  ComputeStrut(&strut_, font);
 
   // Paragraph bounds tracking.
   size_t line_limit = std::min(paragraph_style_.max_lines, line_ranges_.size());
   did_exceed_max_lines_ = (line_ranges_.size() > paragraph_style_.max_lines);
 
+  size_t placeholder_run_index = 0;
   for (size_t line_number = 0; line_number < line_limit; ++line_number) {
     const LineRange& line_range = line_ranges_[line_number];
 
@@ -552,14 +704,8 @@ void Paragraph::Layout(double width, bool force) {
     // Find the runs comprising this line.
     std::vector<BidiRun> line_runs;
     for (const BidiRun& bidi_run : bidi_runs) {
-      if (bidi_run.start() < line_end_index &&
-          bidi_run.end() > line_range.start) {
-        line_runs.emplace_back(std::max(bidi_run.start(), line_range.start),
-                               std::min(bidi_run.end(), line_end_index),
-                               bidi_run.direction(), bidi_run.style());
-      }
       // A "ghost" run is a run that does not impact the layout, breaking,
-      // alignment, width, etc but is still "visible" though getRectsForRange.
+      // alignment, width, etc but is still "visible" through getRectsForRange.
       // For example, trailing whitespace on centered text can be scrolled
       // through with the caret but will not wrap the line.
       //
@@ -567,13 +713,42 @@ void Paragraph::Layout(double width, bool force) {
       // let it impact metrics. After layout of the whitespace run, we do not
       // add its width into the x-offset adjustment, effectively nullifying its
       // impact on the layout.
+      std::unique_ptr<BidiRun> ghost_run = nullptr;
       if (paragraph_style_.ellipsis.empty() &&
           line_range.end_excluding_whitespace < line_range.end &&
           bidi_run.start() <= line_range.end &&
           bidi_run.end() > line_end_index) {
-        line_runs.emplace_back(std::max(bidi_run.start(), line_end_index),
-                               std::min(bidi_run.end(), line_range.end),
-                               bidi_run.direction(), bidi_run.style(), true);
+        ghost_run = std::make_unique<BidiRun>(
+            std::max(bidi_run.start(), line_end_index),
+            std::min(bidi_run.end(), line_range.end), bidi_run.direction(),
+            bidi_run.style(), true);
+      }
+      // Include the ghost run before normal run if RTL
+      if (bidi_run.direction() == TextDirection::rtl && ghost_run != nullptr) {
+        line_runs.push_back(*ghost_run);
+      }
+      // Emplace a normal line run.
+      if (bidi_run.start() < line_end_index &&
+          bidi_run.end() > line_range.start) {
+        // The run is a placeholder run.
+        if (bidi_run.size() == 1 &&
+            text_[bidi_run.start()] == objReplacementChar &&
+            obj_replacement_char_indexes_.count(bidi_run.start()) != 0 &&
+            placeholder_run_index < inline_placeholders_.size()) {
+          line_runs.emplace_back(std::max(bidi_run.start(), line_range.start),
+                                 std::min(bidi_run.end(), line_end_index),
+                                 bidi_run.direction(), bidi_run.style(),
+                                 inline_placeholders_[placeholder_run_index]);
+          placeholder_run_index++;
+        } else {
+          line_runs.emplace_back(std::max(bidi_run.start(), line_range.start),
+                                 std::min(bidi_run.end(), line_end_index),
+                                 bidi_run.direction(), bidi_run.style());
+        }
+      }
+      // Include the ghost run after normal run if LTR
+      if (bidi_run.direction() == TextDirection::ltr && ghost_run != nullptr) {
+        line_runs.push_back(*ghost_run);
       }
     }
     bool line_runs_all_rtl =
@@ -587,6 +762,7 @@ void Paragraph::Layout(double width, bool force) {
 
     std::vector<GlyphPosition> line_glyph_positions;
     std::vector<CodeUnitRun> line_code_unit_runs;
+    std::vector<CodeUnitRun> line_inline_placeholder_code_unit_runs;
     double run_x_offset = 0;
     double justify_x_offset = 0;
     std::vector<PaintRecord> paint_records;
@@ -660,6 +836,17 @@ void Paragraph::Layout(double width, bool force) {
 
       if (layout.nGlyphs() == 0)
         continue;
+
+      // When laying out RTL ghost runs, shift the run_x_offset here by the
+      // advance so that the ghost run is positioned to the left of the first
+      // real run of text in the line. However, since we do not want it to
+      // impact the layout of real text, this advance is subsequently added
+      // back into the run_x_offset after the ghost run positions have been
+      // calcuated and before the next real run of text is laid out, ensuring
+      // later runs are laid out in the same position as if there were no ghost
+      // run.
+      if (run.is_ghost() && run.is_rtl())
+        run_x_offset -= layout.getAdvance();
 
       std::vector<float> layout_advances(text_count);
       layout.getAdvances(layout_advances.data());
@@ -787,12 +974,25 @@ void Paragraph::Layout(double width, bool force) {
 
         if (glyph_positions.empty())
           continue;
+
         SkFontMetrics metrics;
         font.getMetrics(&metrics);
-        paint_records.emplace_back(
-            run.style(), SkPoint::Make(run_x_offset + justify_x_offset, 0),
-            builder.make(), metrics, line_number,
-            layout.getAdvance() + justify_x_offset_delta, run.is_ghost());
+        Range<double> record_x_pos(
+            glyph_positions.front().x_pos.start - run_x_offset,
+            glyph_positions.back().x_pos.end - run_x_offset);
+        if (run.is_placeholder_run()) {
+          paint_records.emplace_back(
+              run.style(), SkPoint::Make(run_x_offset + justify_x_offset, 0),
+              builder.make(), metrics, line_number, record_x_pos.start,
+              record_x_pos.start + run.placeholder_run()->width, run.is_ghost(),
+              run.placeholder_run());
+          run_x_offset += run.placeholder_run()->width;
+        } else {
+          paint_records.emplace_back(
+              run.style(), SkPoint::Make(run_x_offset + justify_x_offset, 0),
+              builder.make(), metrics, line_number, record_x_pos.start,
+              record_x_pos.end, run.is_ghost());
+        }
         justify_x_offset += justify_x_offset_delta;
 
         line_glyph_positions.insert(line_glyph_positions.end(),
@@ -805,21 +1005,34 @@ void Paragraph::Layout(double width, bool force) {
                   [](const GlyphPosition& a, const GlyphPosition& b) {
                     return a.code_units.start < b.code_units.start;
                   });
+
         line_code_unit_runs.emplace_back(
             std::move(code_unit_positions),
             Range<size_t>(run.start(), run.end()),
             Range<double>(glyph_positions.front().x_pos.start,
-                          glyph_positions.back().x_pos.end),
-            line_number, metrics, run.direction());
+                          run.is_placeholder_run()
+                              ? glyph_positions.back().x_pos.start +
+                                    run.placeholder_run()->width
+                              : glyph_positions.back().x_pos.end),
+            line_number, metrics, run.direction(), run.placeholder_run());
+        if (run.is_placeholder_run()) {
+          line_inline_placeholder_code_unit_runs.push_back(
+              line_code_unit_runs.back());
+        }
 
-        min_left_ = std::min(min_left_, glyph_positions.front().x_pos.start);
-        max_right_ = std::max(max_right_, glyph_positions.back().x_pos.end);
+        if (!run.is_ghost()) {
+          min_left_ = std::min(min_left_, glyph_positions.front().x_pos.start);
+          max_right_ = std::max(max_right_, glyph_positions.back().x_pos.end);
+        }
       }  // for each in glyph_blobs
 
-      // Do not increase x offset for trailing ghost runs as it should not
-      // impact the layout of visible glyphs. We do keep the record though so
-      // GetRectsForRange() can find metrics for trailing spaces.
-      if (!run.is_ghost()) {
+      // Do not increase x offset for LTR trailing ghost runs as it should not
+      // impact the layout of visible glyphs. RTL tailing ghost runs have the
+      // advance subtracted, so we do add the advance here to reset the
+      // run_x_offset. We do keep the record though so GetRectsForRange() can
+      // find metrics for trailing spaces.
+      // if (!run.is_ghost() || run.is_rtl()) {
+      if ((!run.is_ghost() || run.is_rtl()) && !run.is_placeholder_run()) {
         run_x_offset += layout.getAdvance();
       }
     }  // for each in line_runs
@@ -828,6 +1041,10 @@ void Paragraph::Layout(double width, bool force) {
     double line_x_offset = GetLineXOffset(run_x_offset);
     if (line_x_offset) {
       for (CodeUnitRun& code_unit_run : line_code_unit_runs) {
+        code_unit_run.Shift(line_x_offset);
+      }
+      for (CodeUnitRun& code_unit_run :
+           line_inline_placeholder_code_unit_runs) {
         code_unit_run.Shift(line_x_offset);
       }
       for (GlyphPosition& position : line_glyph_positions) {
@@ -842,28 +1059,39 @@ void Paragraph::Layout(double width, bool force) {
                               next_line_start - line_range.start);
     code_unit_runs_.insert(code_unit_runs_.end(), line_code_unit_runs.begin(),
                            line_code_unit_runs.end());
+    inline_placeholder_code_unit_runs_.insert(
+        inline_placeholder_code_unit_runs_.end(),
+        line_inline_placeholder_code_unit_runs.begin(),
+        line_inline_placeholder_code_unit_runs.end());
 
     // Calculate the amount to advance in the y direction. This is done by
     // computing the maximum ascent and descent with respect to the strut.
-    double max_ascent = strut.ascent + strut.half_leading;
-    double max_descent = strut.descent + strut.half_leading;
-    SkScalar max_unscaled_ascent = 0;
+    double max_ascent = strut_.ascent + strut_.half_leading;
+    double max_descent = strut_.descent + strut_.half_leading;
+    double max_unscaled_ascent = 0;
     auto update_line_metrics = [&](const SkFontMetrics& metrics,
-                                   const TextStyle& style) {
-      if (!strut.force_strut) {
+                                   const TextStyle& style,
+                                   PlaceholderRun* placeholder_run) {
+      if (!strut_.force_strut) {
         double ascent =
             (-metrics.fAscent + metrics.fLeading / 2) * style.height;
-        max_ascent = std::max(ascent, max_ascent);
-
         double descent =
             (metrics.fDescent + metrics.fLeading / 2) * style.height;
+
+        ComputePlaceholder(placeholder_run, ascent, descent);
+
+        max_ascent = std::max(ascent, max_ascent);
         max_descent = std::max(descent, max_descent);
       }
 
-      max_unscaled_ascent = std::max(-metrics.fAscent, max_unscaled_ascent);
+      max_unscaled_ascent = std::max(placeholder_run == nullptr
+                                         ? -metrics.fAscent
+                                         : placeholder_run->baseline_offset,
+                                     max_unscaled_ascent);
     };
     for (const PaintRecord& paint_record : paint_records) {
-      update_line_metrics(paint_record.metrics(), paint_record.style());
+      update_line_metrics(paint_record.metrics(), paint_record.style(),
+                          paint_record.GetPlaceholderRun());
     }
 
     // If no fonts were actually rendered, then compute a baseline based on the
@@ -874,7 +1102,7 @@ void Paragraph::Layout(double width, bool force) {
       font.setTypeface(GetDefaultSkiaTypeface(style));
       font.setSize(style.font_size);
       font.getMetrics(&metrics);
-      update_line_metrics(metrics, style);
+      update_line_metrics(metrics, style, nullptr);
     }
 
     // Calculate the baselines. This is only done on the first line.
@@ -916,6 +1144,8 @@ void Paragraph::Layout(double width, bool force) {
             [](const CodeUnitRun& a, const CodeUnitRun& b) {
               return a.code_units.start < b.code_units.start;
             });
+
+  longest_line_ = max_right_ - min_left_;
 }
 
 double Paragraph::GetLineXOffset(double line_total_advance) {
@@ -965,6 +1195,10 @@ double Paragraph::GetHeight() const {
 
 double Paragraph::GetMaxWidth() const {
   return width_;
+}
+
+double Paragraph::GetLongestLine() const {
+  return longest_line_;
 }
 
 void Paragraph::SetParagraphStyle(const ParagraphStyle& style) {
@@ -1023,8 +1257,10 @@ void Paragraph::Paint(SkCanvas* canvas, double x, double y) {
       paint.setColor(record.style().color);
     }
     SkPoint offset = base_offset + record.offset();
-    PaintShadow(canvas, record, offset);
-    canvas->drawTextBlob(record.text(), offset.x(), offset.y(), paint);
+    if (record.GetPlaceholderRun() == nullptr) {
+      PaintShadow(canvas, record, offset);
+      canvas->drawTextBlob(record.text(), offset.x(), offset.y(), paint);
+    }
     PaintDecorations(canvas, record, base_offset);
   }
 }
@@ -1070,7 +1306,7 @@ void Paragraph::PaintDecorations(SkCanvas* canvas,
                        record.style().decoration_thickness_multiplier);
 
   SkPoint record_offset = base_offset + record.offset();
-  SkScalar x = record_offset.x();
+  SkScalar x = record_offset.x() + record.x_start();
   SkScalar y = record_offset.y();
 
   // Setup the decorations.
@@ -1111,17 +1347,9 @@ void Paragraph::PaintDecorations(SkCanvas* canvas,
       break;
     }
     case TextDecorationStyle::kWavy: {
-      int wave_count = 0;
-      double x_start = 0;
-      double wavelength =
-          underline_thickness * record.style().decoration_thickness_multiplier;
-      path.moveTo(x, y);
-      while (x_start + wavelength * 2 < width) {
-        path.rQuadTo(wavelength, wave_count % 2 != 0 ? wavelength : -wavelength,
-                     wavelength * 2, 0);
-        x_start += wavelength * 2;
-        ++wave_count;
-      }
+      ComputeWavyDecoration(
+          path, x, y, width,
+          underline_thickness * record.style().decoration_thickness_multiplier);
       break;
     }
   }
@@ -1189,6 +1417,48 @@ void Paragraph::PaintDecorations(SkCanvas* canvas,
   }
 }
 
+void Paragraph::ComputeWavyDecoration(SkPath& path,
+                                      double x,
+                                      double y,
+                                      double width,
+                                      double thickness) {
+  int wave_count = 0;
+  double x_start = 0;
+  // One full wavelength is 4 * thickness.
+  double quarter = thickness;
+  path.moveTo(x, y);
+  double remaining = width;
+  while (x_start + (quarter * 2) < width) {
+    path.rQuadTo(quarter, wave_count % 2 == 0 ? -quarter : quarter, quarter * 2,
+                 0);
+    x_start += quarter * 2;
+    remaining = width - x_start;
+    ++wave_count;
+  }
+  // Manually add a final partial quad for the remaining width that do
+  // not fit nicely into a half-wavelength.
+  // The following math is based off of quadratic bezier equations:
+  //
+  //  * Let P(x) be the equation for the curve.
+  //  * Let P0 = start, P1 = control point, P2 = end
+  //  * P(x) = -2x^2 - 2x
+  //  * P0 = (0, 0)
+  //  * P1 = 2P(0.5) - 0.5 * P0 - 0.5 * P2
+  //  * P2 = P(remaining / (wavelength / 2))
+  //
+  // Simplified implementation coursesy of @jim-flar at
+  // https://github.com/flutter/engine/pull/9468#discussion_r297872739
+  // Unsimplified original version at
+  // https://github.com/flutter/engine/pull/9468#discussion_r297879129
+
+  double x1 = remaining / 2;
+  double y1 = remaining / 2 * (wave_count % 2 == 0 ? -1 : 1);
+  double x2 = remaining;
+  double y2 = (remaining - remaining * remaining / (quarter * 2)) *
+              (wave_count % 2 == 0 ? -1 : 1);
+  path.rQuadTo(x1, y1, x2, y2);
+}
+
 void Paragraph::PaintBackground(SkCanvas* canvas,
                                 const PaintRecord& record,
                                 SkPoint base_offset) {
@@ -1196,8 +1466,8 @@ void Paragraph::PaintBackground(SkCanvas* canvas,
     return;
 
   const SkFontMetrics& metrics = record.metrics();
-  SkRect rect(SkRect::MakeLTRB(0, metrics.fAscent, record.GetRunWidth(),
-                               metrics.fDescent));
+  SkRect rect(SkRect::MakeLTRB(record.x_start(), metrics.fAscent,
+                               record.x_end(), metrics.fDescent));
   rect.offset(base_offset + record.offset());
   canvas->drawRect(rect, record.style().background);
 }
@@ -1259,6 +1529,13 @@ std::vector<Paragraph::TextBox> Paragraph::GetRectsForRange(
     double baseline = line_baselines_[run.line_number];
     SkScalar top = baseline + run.font_metrics.fAscent;
     SkScalar bottom = baseline + run.font_metrics.fDescent;
+
+    if (run.placeholder_run !=
+        nullptr) {  // Use inline placeholder size as height.
+      top = baseline - run.placeholder_run->baseline_offset;
+      bottom = baseline + run.placeholder_run->height -
+               run.placeholder_run->baseline_offset;
+    }
 
     max_line = std::max(run.line_number, max_line);
     min_line = std::min(run.line_number, min_line);
@@ -1405,7 +1682,8 @@ std::vector<Paragraph::TextBox> Paragraph::GetRectsForRange(
                 line_baselines_[kv.first] + line_max_descent_[kv.first]),
             box.direction);
       }
-    } else {  // kIncludeLineSpacingBottom
+    } else if (rect_height_style ==
+               RectHeightStyle::kIncludeLineSpacingBottom) {
       for (const Paragraph::TextBox& box : kv.second.boxes) {
         SkScalar adjusted_bottom =
             line_baselines_[kv.first] + line_max_descent_[kv.first];
@@ -1418,6 +1696,20 @@ std::vector<Paragraph::TextBox> Paragraph::GetRectsForRange(
                                                 line_max_ascent_[kv.first],
                                             box.rect.fRight, adjusted_bottom),
                            box.direction);
+      }
+    } else if (rect_height_style == RectHeightStyle::kStrut) {
+      if (IsStrutValid()) {
+        for (const Paragraph::TextBox& box : kv.second.boxes) {
+          boxes.emplace_back(
+              SkRect::MakeLTRB(
+                  box.rect.fLeft, line_baselines_[kv.first] - strut_.ascent,
+                  box.rect.fRight, line_baselines_[kv.first] + strut_.descent),
+              box.direction);
+        }
+      } else {
+        // Fall back to tight bounds if the strut is invalid.
+        boxes.insert(boxes.end(), kv.second.boxes.begin(),
+                     kv.second.boxes.end());
       }
     }
   }
@@ -1481,6 +1773,46 @@ Paragraph::PositionWithAffinity Paragraph::GetGlyphPositionAtCoordinate(
   } else {
     return PositionWithAffinity(gp->code_units.end, UPSTREAM);
   }
+}
+
+// We don't cache this because since this returns all boxes, it is usually
+// unnecessary to call this multiple times in succession.
+std::vector<Paragraph::TextBox> Paragraph::GetRectsForPlaceholders() const {
+  // Struct that holds calculated metrics for each line.
+  struct LineBoxMetrics {
+    std::vector<Paragraph::TextBox> boxes;
+    // Per-line metrics for max and min coordinates for left and right boxes.
+    // These metrics cannot be calculated in layout generically because of
+    // selections that do not cover the whole line.
+    SkScalar max_right = FLT_MIN;
+    SkScalar min_left = FLT_MAX;
+  };
+
+  std::vector<Paragraph::TextBox> boxes;
+
+  // Generate initial boxes and calculate metrics.
+  for (const CodeUnitRun& run : inline_placeholder_code_unit_runs_) {
+    // Check to see if we are finished.
+    double baseline = line_baselines_[run.line_number];
+    SkScalar top = baseline + run.font_metrics.fAscent;
+    SkScalar bottom = baseline + run.font_metrics.fDescent;
+
+    if (run.placeholder_run !=
+        nullptr) {  // Use inline placeholder size as height.
+      top = baseline - run.placeholder_run->baseline_offset;
+      bottom = baseline + run.placeholder_run->height -
+               run.placeholder_run->baseline_offset;
+    }
+
+    // Calculate left and right.
+    SkScalar left, right;
+    left = run.x_pos.start;
+    right = run.x_pos.end;
+
+    boxes.emplace_back(SkRect::MakeLTRB(left, top, right, bottom),
+                       run.direction);
+  }
+  return boxes;
 }
 
 Paragraph::Range<size_t> Paragraph::GetWordBoundary(size_t offset) const {

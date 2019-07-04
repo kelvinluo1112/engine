@@ -6,7 +6,7 @@
 
 #import <objc/message.h>
 
-#import "flutter/shell/platform/darwin/ios/framework/Headers/FlutterCodecs.h"
+#import "flutter/shell/platform/darwin/common/framework/Headers/FlutterCodecs.h"
 #import "flutter/shell/platform/darwin/macos/framework/Source/FLETextInputModel.h"
 #import "flutter/shell/platform/darwin/macos/framework/Source/FLEViewController_Internal.h"
 
@@ -72,7 +72,7 @@ static NSString* const kMultilineInputType = @"TextInputType.multiline";
   if (self != nil) {
     _flutterViewController = viewController;
     _channel = [FlutterMethodChannel methodChannelWithName:kTextInputChannel
-                                           binaryMessenger:viewController
+                                           binaryMessenger:viewController.engine.binaryMessenger
                                                      codec:[FlutterJSONMethodCodec sharedInstance]];
     __weak FLETextInputPlugin* weakSelf = self;
     [_channel setMethodCallHandler:^(FlutterMethodCall* call, FlutterResult result) {
@@ -242,11 +242,13 @@ static NSString* const kMultilineInputType = @"TextInputType.multiline";
 }
 
 - (void)insertNewline:(id)sender {
-  if ([self.activeModel.inputType isEqualToString:kMultilineInputType]) {
-    [self insertText:@"\n" replacementRange:self.activeModel.selectedRange];
+  if (self.activeModel != nil) {
+    if ([self.activeModel.inputType isEqualToString:kMultilineInputType]) {
+      [self insertText:@"\n" replacementRange:self.activeModel.selectedRange];
+    }
+    [_channel invokeMethod:kPerformAction
+                 arguments:@[ _activeClientID, self.activeModel.inputAction ]];
   }
-  [_channel invokeMethod:kPerformAction
-               arguments:@[ _activeClientID, self.activeModel.inputAction ]];
 }
 
 - (void)setMarkedText:(id)string

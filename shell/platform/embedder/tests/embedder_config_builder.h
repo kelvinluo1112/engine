@@ -11,7 +11,7 @@
 #include "flutter/shell/platform/embedder/tests/embedder_context.h"
 #include "flutter/shell/platform/embedder/tests/embedder_test.h"
 
-namespace shell {
+namespace flutter {
 namespace testing {
 
 struct UniqueEngineTraits {
@@ -19,7 +19,7 @@ struct UniqueEngineTraits {
 
   static bool IsValid(const FlutterEngine& value) { return value != nullptr; }
 
-  static void Free(FlutterEngine engine) {
+  static void Free(FlutterEngine& engine) {
     auto result = FlutterEngineShutdown(engine);
     FML_CHECK(result == kSuccess);
   }
@@ -42,27 +42,41 @@ class EmbedderConfigBuilder {
 
   void SetSoftwareRendererConfig();
 
+  void SetOpenGLRendererConfig();
+
   void SetAssetsPath();
 
   void SetSnapshots();
 
   void SetIsolateCreateCallbackHook();
 
+  void SetSemanticsCallbackHooks();
+
   void SetDartEntrypoint(std::string entrypoint);
 
-  UniqueEngine LaunchEngine() const;
+  void AddCommandLineArgument(std::string arg);
+
+  void SetPlatformTaskRunner(const FlutterTaskRunnerDescription* runner);
+
+  void SetPlatformMessageCallback(
+      std::function<void(const FlutterPlatformMessage*)> callback);
+
+  UniqueEngine LaunchEngine();
 
  private:
   EmbedderContext& context_;
   FlutterProjectArgs project_args_ = {};
   FlutterRendererConfig renderer_config_ = {};
   FlutterSoftwareRendererConfig software_renderer_config_ = {};
+  FlutterOpenGLRendererConfig opengl_renderer_config_ = {};
   std::string dart_entrypoint_;
+  FlutterCustomTaskRunners custom_task_runners_ = {};
+  std::vector<std::string> command_line_arguments_;
 
   FML_DISALLOW_COPY_AND_ASSIGN(EmbedderConfigBuilder);
 };
 
 }  // namespace testing
-}  // namespace shell
+}  // namespace flutter
 
 #endif  // FLUTTER_SHELL_PLATFORM_EMBEDDER_TESTS_EMBEDDER_CONFIG_BUILDER_H_

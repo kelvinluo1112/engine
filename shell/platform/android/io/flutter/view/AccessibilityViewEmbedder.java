@@ -4,9 +4,12 @@
 
 package io.flutter.view;
 
+import android.annotation.SuppressLint;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Parcel;
+import android.os.Parcelable;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.util.Log;
@@ -19,6 +22,7 @@ import android.view.accessibility.AccessibilityNodeProvider;
 import android.view.accessibility.AccessibilityRecord;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
@@ -37,7 +41,7 @@ import java.util.Map;
  * for the virtual accessibility node IDs in the platform view's tree. Internally this class maintains a bidirectional
  * mapping between `flutterId`s and the corresponding platform view and `originId`.
  */
-class AccessibilityViewEmbedder {
+final class AccessibilityViewEmbedder {
     private static final String TAG = "AccessibilityBridge";
 
     private final ReflectionAccessors reflectionAccessors;
@@ -51,11 +55,10 @@ class AccessibilityViewEmbedder {
     // Maps a platform view and originId to a corresponding flutterID.
     private final Map<ViewAndId, Integer> originToFlutterId;
 
-    // Maps the flutterId of an accessibility node to the screen bounds of
-    // the root semantic node for the embedded view.
+    // Maps an embedded view to it's screen bounds.
     // This is used to translate the coordinates of the accessibility node subtree to the main display's coordinate
     // system.
-    private final SparseArray<Rect> flutterIdToDisplayBounds;
+    private final Map<View, Rect> embeddedViewToDisplayBounds;
 
     private int nextFlutterId;
 
@@ -64,8 +67,8 @@ class AccessibilityViewEmbedder {
         flutterIdToOrigin = new SparseArray<>();
         this.rootAccessibilityView = rootAccessibiiltyView;
         nextFlutterId = firstVirtualNodeId;
-        flutterIdToDisplayBounds = new SparseArray<>();
         originToFlutterId = new HashMap<>();
+        embeddedViewToDisplayBounds = new HashMap<>();
     }
 
     /**
@@ -80,10 +83,9 @@ class AccessibilityViewEmbedder {
         if (originPackedId == null) {
             return null;
         }
+        embeddedViewToDisplayBounds.put(embeddedView, displayBounds);
         int originId = ReflectionAccessors.getVirtualNodeId(originPackedId);
-        flutterIdToOrigin.put(flutterId, new ViewAndId(embeddedView, originId));
-        flutterIdToDisplayBounds.put(flutterId, displayBounds);
-        originToFlutterId.put(new ViewAndId(embeddedView, originId), flutterId);
+        cacheVirtualIdMappings(embeddedView, originId, flutterId);
         return convertToFlutterNode(originNode, flutterId, embeddedView);
     }
 
@@ -94,6 +96,13 @@ class AccessibilityViewEmbedder {
     public AccessibilityNodeInfo createAccessibilityNodeInfo(int flutterId) {
         ViewAndId origin = flutterIdToOrigin.get(flutterId);
         if (origin == null) {
+            return null;
+        }
+        if (!embeddedViewToDisplayBounds.containsKey(origin.view)) {
+            // This might happen if the embedded view is sending accessibility event before the first Flutter semantics
+            // tree was sent to the accessibility bridge. In this case we don't return a node as we do not know the
+            // bounds yet.
+            // https://github.com/flutter/flutter/issues/30068
             return null;
         }
         AccessibilityNodeProvider provider = origin.view.getAccessibilityNodeProvider();
@@ -127,11 +136,11 @@ class AccessibilityViewEmbedder {
         result.setSource(rootAccessibilityView, flutterId);
         result.setClassName(originNode.getClassName());
 
-        Rect displayBounds = flutterIdToDisplayBounds.get(flutterId);
+        Rect displayBounds = embeddedViewToDisplayBounds.get(embeddedView);
 
         copyAccessibilityFields(originNode, result);
         setFlutterNodesTranslateBounds(originNode, displayBounds, result);
-        addChildrenToFlutterNode(originNode, embeddedView, displayBounds, result);
+        addChildrenToFlutterNode(originNode, embeddedView, result);
         setFlutterNodeParent(originNode, embeddedView, result);
 
         return result;
@@ -157,7 +166,6 @@ class AccessibilityViewEmbedder {
     private void addChildrenToFlutterNode(
             @NonNull AccessibilityNodeInfo originNode,
             @NonNull View embeddedView,
-            @NonNull Rect displayBounds,
             @NonNull AccessibilityNodeInfo resultNode
     ) {
         for (int i = 0; i < originNode.getChildCount(); i++) {
@@ -172,12 +180,19 @@ class AccessibilityViewEmbedder {
                 childFlutterId = originToFlutterId.get(origin);
             } else {
                 childFlutterId = nextFlutterId++;
-                originToFlutterId.put(origin, childFlutterId);
-                flutterIdToOrigin.put(childFlutterId, origin);
-                flutterIdToDisplayBounds.put(childFlutterId, displayBounds);
+                cacheVirtualIdMappings(embeddedView, originId, childFlutterId);
             }
             resultNode.addChild(rootAccessibilityView, childFlutterId);
         }
+    }
+
+    // Caches a bidirectional mapping of (embeddedView, originId)<-->flutterId.
+    // Where originId is a virtual node ID in the embeddedView's tree, and flutterId is the ID
+    // of the corresponding node in the Flutter virtual accessibility nodes tree.
+    private void cacheVirtualIdMappings(@NonNull View embeddedView, int originId, int flutterId) {
+        ViewAndId origin = new ViewAndId(embeddedView, originId);
+        originToFlutterId.put(origin, flutterId);
+        flutterIdToOrigin.put(flutterId, origin);
     }
 
     private void setFlutterNodesTranslateBounds(
@@ -265,7 +280,8 @@ class AccessibilityViewEmbedder {
         int originVirtualId = ReflectionAccessors.getVirtualNodeId(originPackedId);
         Integer flutterId = originToFlutterId.get(new ViewAndId(embeddedView, originVirtualId));
         if (flutterId == null) {
-            return false;
+            flutterId = nextFlutterId++;
+            cacheVirtualIdMappings(embeddedView, originVirtualId, flutterId);
         }
         translatedEvent.setSource(rootAccessibilityView, flutterId);
         translatedEvent.setClassName(event.getClassName());
@@ -333,7 +349,7 @@ class AccessibilityViewEmbedder {
         if (origin == null) {
             return false;
         }
-        Rect displayBounds = flutterIdToDisplayBounds.get(rootFlutterId);
+        Rect displayBounds = embeddedViewToDisplayBounds.get(origin.view);
         int pointerCount = event.getPointerCount();
         MotionEvent.PointerProperties[] pointerProperties = new MotionEvent.PointerProperties[pointerCount];
         MotionEvent.PointerCoords[] pointerCoords = new MotionEvent.PointerCoords[pointerCount];
@@ -397,40 +413,63 @@ class AccessibilityViewEmbedder {
     }
 
     private static class ReflectionAccessors {
-        private final Method getSourceNodeId;
-        private final Method getParentNodeId;
-        private final Method getRecordSourceNodeId;
-        private final Method getChildId;
+        private @Nullable final Method getSourceNodeId;
+        private @Nullable final Method getParentNodeId;
+        private @Nullable final Method getRecordSourceNodeId;
+        private @Nullable final Method getChildId;
+        private @Nullable final Field childNodeIdsField;
+        private @Nullable final Method longArrayGetIndex;
 
+        @SuppressLint("PrivateApi")
         private ReflectionAccessors() {
             Method getSourceNodeId = null;
             Method getParentNodeId = null;
             Method getRecordSourceNodeId = null;
             Method getChildId = null;
+            Field childNodeIdsField = null;
+            Method longArrayGetIndex = null;
             try {
                 getSourceNodeId = AccessibilityNodeInfo.class.getMethod("getSourceNodeId");
             } catch (NoSuchMethodException e) {
                 Log.w(TAG, "can't invoke AccessibilityNodeInfo#getSourceNodeId with reflection");
             }
             try {
-                getParentNodeId = AccessibilityNodeInfo.class.getMethod("getParentNodeId");
-            } catch (NoSuchMethodException e) {
-                Log.w(TAG, "can't invoke getParentNodeId with reflection");
-            }
-            try {
                 getRecordSourceNodeId = AccessibilityRecord.class.getMethod("getSourceNodeId");
             } catch (NoSuchMethodException e) {
                 Log.w(TAG, "can't invoke AccessibiiltyRecord#getSourceNodeId with reflection");
             }
-            try {
-                getChildId = AccessibilityNodeInfo.class.getMethod("getChildId", int.class);
-            } catch (NoSuchMethodException e) {
-                Log.w(TAG, "can't invoke getChildId with reflection");
+            // Reflection access is not allowed starting Android P on these methods.
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.O) {
+                try {
+                    getParentNodeId = AccessibilityNodeInfo.class.getMethod("getParentNodeId");
+                } catch (NoSuchMethodException e) {
+                    Log.w(TAG, "can't invoke getParentNodeId with reflection");
+                }
+                // Starting P we extract the child id from the mChildNodeIds field (see getChildId
+                // below).
+                try {
+                    getChildId = AccessibilityNodeInfo.class.getMethod("getChildId", int.class);
+                } catch (NoSuchMethodException e) {
+                    Log.w(TAG, "can't invoke getChildId with reflection");
+                }
+            } else {
+                try {
+                    childNodeIdsField = AccessibilityNodeInfo.class.getDeclaredField("mChildNodeIds");
+                    childNodeIdsField.setAccessible(true);
+                    // The private member is a private utility class to Android. We need to use
+                    // reflection to actually handle the data too.
+                    longArrayGetIndex = Class.forName("android.util.LongArray").getMethod("get", int.class);
+                } catch (NoSuchFieldException | ClassNotFoundException | NoSuchMethodException | NullPointerException e) {
+                    Log.w(TAG, "can't access childNodeIdsField with reflection");
+                    childNodeIdsField = null;
+                }
             }
             this.getSourceNodeId = getSourceNodeId;
             this.getParentNodeId = getParentNodeId;
             this.getRecordSourceNodeId = getRecordSourceNodeId;
             this.getChildId = getChildId;
+            this.childNodeIdsField = childNodeIdsField;
+            this.longArrayGetIndex = longArrayGetIndex;
         }
 
         /** Returns virtual node ID given packed node ID used internally in accessibility API. */
@@ -455,32 +494,105 @@ class AccessibilityViewEmbedder {
 
         @Nullable
         private Long getChildId(@NonNull AccessibilityNodeInfo node, int child) {
-            if (getChildId == null) {
+            if (getChildId == null && (childNodeIdsField == null || longArrayGetIndex == null)) {
                 return null;
             }
-            try {
-                return (Long) getChildId.invoke(node, child);
-            } catch (IllegalAccessException e) {
-                Log.w(TAG, e);
-            } catch (InvocationTargetException e) {
-                Log.w(TAG, e);
+            if (getChildId != null) {
+                try {
+                    return (Long) getChildId.invoke(node, child);
+                // Using identical separate catch blocks to comply with the following lint:
+                // Error: Multi-catch with these reflection exceptions requires API level 19
+                // (current min is 16) because they get compiled to the common but new super
+                // type ReflectiveOperationException. As a workaround either create individual
+                // catch statements, or catch Exception. [NewApi]
+                } catch (IllegalAccessException e) {
+                    Log.w(TAG, e);
+                } catch (InvocationTargetException e) {
+                    Log.w(TAG, e);
+                }
+            } else {
+                try {
+                    return (long) longArrayGetIndex.invoke(childNodeIdsField.get(node), child);
+                // Using identical separate catch blocks to comply with the following lint:
+                // Error: Multi-catch with these reflection exceptions requires API level 19
+                // (current min is 16) because they get compiled to the common but new super
+                // type ReflectiveOperationException. As a workaround either create individual
+                // catch statements, or catch Exception. [NewApi]
+                } catch (IllegalAccessException e) {
+                    Log.w(TAG, e);
+                } catch (InvocationTargetException | ArrayIndexOutOfBoundsException e) {
+                    Log.w(TAG, e);
+                }
             }
             return null;
         }
 
         @Nullable
         private Long getParentNodeId(@NonNull AccessibilityNodeInfo node) {
-            if (getParentNodeId == null) {
+            if (getParentNodeId != null) {
+                try {
+                    return (long) getParentNodeId.invoke(node);
+                // Using identical separate catch blocks to comply with the following lint:
+                // Error: Multi-catch with these reflection exceptions requires API level 19
+                // (current min is 16) because they get compiled to the common but new super
+                // type ReflectiveOperationException. As a workaround either create individual
+                // catch statements, or catch Exception. [NewApi]
+                } catch (IllegalAccessException e) {
+                    Log.w(TAG, e);
+                } catch (InvocationTargetException e) {
+                    Log.w(TAG, e);
+                }
+            }
+
+            // Fall back on reading the ID from a serialized data if we absolutely have to.
+            return yoinkParentIdFromParcel(node);
+        }
+
+        // If this looks like it's failing, that's because it probably is. This method is relying on
+        // the implementation details of `AccessibilityNodeInfo#writeToParcel` in order to find the
+        // particular bit in the opaque parcel that represents mParentNodeId. If the implementation
+        // details change from our assumptions in this method, this will silently break.
+        @Nullable
+        private static Long yoinkParentIdFromParcel(AccessibilityNodeInfo node) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                Log.w(TAG, "Unexpected Android version. Unable to find the parent ID.");
                 return null;
             }
-            try {
-                return (long) getParentNodeId.invoke(node);
-            } catch (IllegalAccessException e) {
-                Log.w(TAG, e);
-            } catch (InvocationTargetException e) {
-                Log.w(TAG, e);
+
+            // We're creating a copy here because writing a node to a parcel recycles it. Objects
+            // are passed by reference in Java. So even though this method doesn't seem to use the
+            // node again, it's really used in other methods that would throw exceptions if we
+            // recycle it here.
+            AccessibilityNodeInfo copy = AccessibilityNodeInfo.obtain(node);
+            final Parcel parcel = Parcel.obtain();
+            parcel.setDataPosition(0);
+            copy.writeToParcel(parcel, /*flags=*/ 0);
+            Long parentNodeId = null;
+            // Match the internal logic that sets where mParentId actually ends up finally living.
+            // This logic should match
+            // https://android.googlesource.com/platform/frameworks/base/+/0b5ca24a4/core/java/android/view/accessibility/AccessibilityNodeInfo.java#3524.
+            parcel.setDataPosition(0);
+            long nonDefaultFields = parcel.readLong();
+            int fieldIndex = 0;
+            if (isBitSet(nonDefaultFields, fieldIndex++)) {
+                parcel.readInt(); // mIsSealed
             }
-            return null;
+            if (isBitSet(nonDefaultFields, fieldIndex++)) {
+                parcel.readLong(); // mSourceNodeId
+            }
+            if (isBitSet(nonDefaultFields, fieldIndex++)) {
+                parcel.readInt();  // mWindowId
+            }
+            if (isBitSet(nonDefaultFields, fieldIndex++)) {
+                parentNodeId = parcel.readLong();
+            }
+
+            parcel.recycle();
+            return parentNodeId;
+        }
+
+        private static boolean isBitSet(long flags, int bitIndex) {
+            return (flags & (1L << bitIndex)) != 0;
         }
 
         @Nullable

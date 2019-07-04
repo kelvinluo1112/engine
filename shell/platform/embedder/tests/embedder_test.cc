@@ -4,7 +4,7 @@
 
 #include "flutter/shell/platform/embedder/tests/embedder_test.h"
 
-namespace shell {
+namespace flutter {
 namespace testing {
 
 EmbedderTest::EmbedderTest() = default;
@@ -12,7 +12,7 @@ EmbedderTest::EmbedderTest() = default;
 EmbedderTest::~EmbedderTest() = default;
 
 std::string EmbedderTest::GetFixturesDirectory() const {
-  return ::testing::GetFixturesPath();
+  return GetFixturesPath();
 }
 
 EmbedderContext& EmbedderTest::GetEmbedderContext() {
@@ -27,13 +27,14 @@ EmbedderContext& EmbedderTest::GetEmbedderContext() {
 
 // |testing::Test|
 void EmbedderTest::SetUp() {
-  // Nothing to do here since we will lazily setup the context when asked.
+  ThreadTest::SetUp();
 }
 
 // |testing::Test|
 void EmbedderTest::TearDown() {
   embedder_context_.reset();
+  ThreadTest::TearDown();
 }
 
 }  // namespace testing
-}  // namespace shell
+}  // namespace flutter
